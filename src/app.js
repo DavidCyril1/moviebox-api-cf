@@ -242,6 +242,11 @@ async function proxyMp4(c, { disposition }) {
   const se = Number(param(c, "se"));
   const ep = Number(param(c, "ep"));
   const resolution = Number(c.req.query("resolution") ?? 480);
+  // force=proxy → try Worker pipe (often fails: CDN blocks CF with 427)
+  // default → 302 to signed CDN URL (client IP downloads; works for 300MB+)
+  const forceProxy = ["1", "true", "yes"].includes(
+    String(c.req.query("proxy") || "").toLowerCase()
+  );
 
   const { mp4Url, item } = await resolveRealMp4(subjectId, se, ep, resolution);
 
@@ -264,8 +269,21 @@ async function proxyMp4(c, { disposition }) {
     ? `${title} - ${actualRes}p.mp4`
     : `${title} - S${String(se).padStart(2, "0")}E${String(ep).padStart(2, "0")} - ${actualRes}p.mp4`;
 
-  const rangeHeader = c.req.header("range");
+  // Default path: redirect client to signed CDN (CF egress is blocked by CDN → 427)
+  if (!forceProxy) {
+    const headers = {
+      location: mp4Url,
+      "access-control-allow-origin": "*",
+      "cache-control": "no-store",
+    };
+    if (disposition === "attachment") {
+      headers["content-disposition"] = `attachment; filename="${filename}"`;
+    }
+    return new Response(null, { status: 302, headers });
+  }
 
+  // Optional Worker-side pipe (proxy=1) — may fail if CDN blocks Cloudflare ASN
+  const rangeHeader = c.req.header("range");
   let cookieHeader = "";
   try {
     const play = await mb.getPlayInfo(subjectId, se, ep).catch(() => null);
@@ -276,7 +294,7 @@ async function proxyMp4(c, { disposition }) {
     if (pick?.signCookie) {
       cookieHeader = String(pick.signCookie)
         .split(";")
-        .map((p) => p.trim())
+        .map((part) => part.trim())
         .filter(Boolean)
         .join("; ");
     }
@@ -290,12 +308,8 @@ async function proxyMp4(c, { disposition }) {
     "accept-encoding": "identity",
   };
   if (rangeHeader) baseHeaders["range"] = rangeHeader;
-
   if (cookieHeader) baseHeaders["cookie"] = cookieHeader;
 
-  // CDN accepts CF egress (MovieBox API does not).
-  // Do NOT use socksflare/Rustls here — CDN TLS triggers ProtocolVersion fatals.
-  // Native fetch streams the body through the Worker to the client.
   async function cdnFetch(extra = {}) {
     let url = mp4Url;
     for (let hop = 0; hop < 6; hop++) {
@@ -308,7 +322,11 @@ async function proxyMp4(c, { disposition }) {
         const loc = res.headers.get("location");
         if (!loc) return res;
         url = loc.startsWith("http") ? loc : new URL(loc, url).toString();
-        try { await res.arrayBuffer(); } catch { /* drain */ }
+        try {
+          await res.arrayBuffer();
+        } catch {
+          /* drain */
+        }
         continue;
       }
       return res;
@@ -320,10 +338,17 @@ async function proxyMp4(c, { disposition }) {
   if (res.status >= 400 && cookieHeader) {
     res = await cdnFetch({});
   }
+
+  // CDN blocked CF (427/403/428) → fall back to redirect
   if (res.status >= 400) {
-    const err = new Error(`CDN returned ${res.status}`);
-    err.status = 502;
-    throw err;
+    return new Response(null, {
+      status: 302,
+      headers: {
+        location: mp4Url,
+        "access-control-allow-origin": "*",
+        "cache-control": "no-store",
+      },
+    });
   }
 
   const disp =
@@ -351,11 +376,6 @@ async function proxyMp4(c, { disposition }) {
   });
 }
 
-/**
- * GET /stream/:subjectId/:se/:ep?resolution=480
- * CDN-safe playback: streams real MP4 through this server (inline).
- * Same path as before — clients keep the same URL.
- */
 app.get("/stream/:subjectId/:se/:ep", async (c) => {
   try {
     if (c.req.query("redirect") === "0") {
