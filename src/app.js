@@ -293,19 +293,33 @@ async function proxyMp4(c, { disposition }) {
 
   if (cookieHeader) baseHeaders["cookie"] = cookieHeader;
 
-  // CDN via SOCKS5 (same proxy) — CF egress blocked
-  let res = await mb.upstreamFetch(mp4Url, {
-    method: "GET",
-    headers: baseHeaders,
-    timeoutMs: 60_000,
-  });
-
-  if (res.status >= 400 && cookieHeader) {
-    const h2 = { ...baseHeaders };
-    delete h2.cookie;
-    res = await mb.upstreamFetch(mp4Url, { method: "GET", headers: h2, timeoutMs: 60_000 });
+  // CDN accepts CF egress (MovieBox API does not).
+  // Do NOT use socksflare/Rustls here — CDN TLS triggers ProtocolVersion fatals.
+  // Native fetch streams the body through the Worker to the client.
+  async function cdnFetch(extra = {}) {
+    let url = mp4Url;
+    for (let hop = 0; hop < 6; hop++) {
+      const res = await fetch(url, {
+        method: "GET",
+        headers: { ...baseHeaders, ...extra },
+        redirect: "manual",
+      });
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers.get("location");
+        if (!loc) return res;
+        url = loc.startsWith("http") ? loc : new URL(loc, url).toString();
+        try { await res.arrayBuffer(); } catch { /* drain */ }
+        continue;
+      }
+      return res;
+    }
+    return fetch(url, { method: "GET", headers: { ...baseHeaders, ...extra } });
   }
 
+  let res = await cdnFetch(cookieHeader ? { cookie: cookieHeader } : {});
+  if (res.status >= 400 && cookieHeader) {
+    res = await cdnFetch({});
+  }
   if (res.status >= 400) {
     const err = new Error(`CDN returned ${res.status}`);
     err.status = 502;
