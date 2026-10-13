@@ -1,0 +1,22 @@
+name = "moviebox-api-cf"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Optional: persist guest token across isolates
+# Create a KV namespace: wrangler kv:namespace create TOKEN_STORE
+# then uncomment and paste the id:
+# [[kv_namespaces]]
+# binding = "TOKEN_STORE"
+# id = "YOUR_KV_NAMESPACE_ID"
+
+[vars]
+# Optional overrides (same as Node version):
+# MB_TOKEN = ""
+# MB_MIRROR_BASE = "https://moviebox.davidcyril.name.ng"
+# MB_GUEST_TIMEOUT_MS = "90000"
+# MB_REQUEST_TIMEOUT_MS = "20000"
+
+# Larger CPU for stream proxy + guest registration
+[limits]
+cpu_ms = 30000
