@@ -1,7 +1,7 @@
 {
   "name": "moviebox-api-cf",
   "version": "1.2.0",
-  "description": "Unofficial MovieBox scraper API — Cloudflare Workers (identical responses to moviebox-api-node)",
+  "description": "Unofficial MovieBox scraper API \u2014 Cloudflare Workers (identical responses to moviebox-api-node)",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
@@ -9,7 +9,8 @@
     "tail": "wrangler tail"
   },
   "dependencies": {
-    "hono": "4.6.12"
+    "hono": "4.6.12",
+    "socksflare": "0.4.0"
   },
   "devDependencies": {
     "wrangler": "^3.99.0"

@@ -1,22 +1,19 @@
 /**
- * MovieBox API client — Cloudflare Workers port
- * Wraps https://api6.aoneroom.com/wefeed-mobile-bff/
- * Env: MB_TOKEN, MB_MIRROR_BASE, MB_GUEST_TIMEOUT_MS, MB_REQUEST_TIMEOUT_MS
- *
- * All MovieBox upstream traffic goes through proxy.maxwell.deals
- * (HTTP / SOCKS5, random) because CF egress IPs are blocked.
- *
- * Token strategy (fail-soft):
- *  1) in-memory cache
- *  2) MB_TOKEN env
- *  3) baked FALLBACK_TOKEN while still valid
- *  4) guest registration via temp-mail
+ * MovieBox API client — Cloudflare Workers
+ * Upstream via SOCKS5 (socksflare) — CF IPs blocked by MovieBox.
+ * Signature: accept=application/json required.
  */
-import { sign } from "./sign.js";
-import { randomBytes } from "node:crypto";
+import { sign, clientToken } from "./sign.js";
+import { randomBytes, createHash } from "node:crypto";
 import { upstreamFetch } from "./proxy.js";
 
 const BASE = "https://api6.aoneroom.com";
+const HOSTS = [
+  "https://api6.aoneroom.com",
+  "https://api5.aoneroom.com",
+  "https://api4.aoneroom.com",
+  "https://api.inmoviebox.com",
+];
 
 function getEnv(key, fallback = undefined) {
   const e = globalThis.__MB_ENV__ || {};
@@ -28,8 +25,6 @@ function getEnv(key, fallback = undefined) {
 function mirrorBase() {
   return (getEnv("MB_MIRROR_BASE") || "https://moviebox.davidcyril.name.ng").replace(/\/$/, "");
 }
-
-const HOST_PARAM = `host=${encodeURIComponent(BASE)}`;
 
 const CLIENT_BUILD =
   "1786863422670304777.c58dd77ad46d7d89b4605211013d392f" +
@@ -66,7 +61,7 @@ const FALLBACK_TOKEN =
   ".l4MFha-s4DfMUOEQqPUGKZ_1NqfgI7NewaGJ0Saruik";
 
 function requestTimeoutMs() {
-  return Number(getEnv("MB_REQUEST_TIMEOUT_MS") || 20_000);
+  return Number(getEnv("MB_REQUEST_TIMEOUT_MS") || 25_000);
 }
 function guestTimeoutMs() {
   return Number(getEnv("MB_GUEST_TIMEOUT_MS") || 90_000);
@@ -76,6 +71,7 @@ let _cachedToken = null;
 let _cachedClientInfo = null;
 let _guestTokenInflight = null;
 let _lastGuestFailAt = 0;
+let _hostIdx = 0;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -135,10 +131,7 @@ function activeClientInfo() {
 
 export async function getGuestToken() {
   if (_guestTokenInflight) return _guestTokenInflight;
-
-  if (Date.now() - _lastGuestFailAt < 60_000 && _cachedToken) {
-    return _cachedToken;
-  }
+  if (Date.now() - _lastGuestFailAt < 60_000 && _cachedToken) return _cachedToken;
 
   _guestTokenInflight = (async () => {
     try {
@@ -166,11 +159,9 @@ export async function getGuestToken() {
       _guestTokenInflight = null;
     }
   })();
-
   return _guestTokenInflight;
 }
 
-/** Temp-mail providers stay on direct fetch (they don't block CF). */
 async function rawRequest(url, opts = {}) {
   const controller = new AbortController();
   const to = setTimeout(() => controller.abort(), requestTimeoutMs());
@@ -188,7 +179,36 @@ async function rawRequest(url, opts = {}) {
   }
 }
 
-/** MovieBox upstream — always via proxy */
+function buildHeaders(method, url, token, contentType, body) {
+  const ts = String(Date.now());
+  const accept = "application/json";
+  const ct = contentType || "";
+  const sig = sign(url, {
+    method,
+    accept,
+    contentType: ct,
+    body,
+    timestampMs: ts,
+  });
+  const h = {
+    accept,
+    "x-tr-signature": sig,
+    "x-client-token": clientToken(ts),
+    authorization: `Bearer ${token}`,
+    "x-client-info": activeClientInfo(),
+    "x-client-build": CLIENT_BUILD,
+    "x-play-mode": "2",
+    "x-idle-data": "1",
+    "x-family-mode": "0",
+    "x-content-mode": "0",
+    "x-client-status": "1",
+    "x-child-uid": "",
+    "user-agent": "okhttp/4.9.3",
+  };
+  if (ct) h["content-type"] = ct;
+  return h;
+}
+
 async function mbRequest(url, opts = {}) {
   const res = await upstreamFetch(url, {
     method: opts.method || "GET",
@@ -197,9 +217,106 @@ async function mbRequest(url, opts = {}) {
     timeoutMs: requestTimeoutMs(),
   });
   const text = await res.text();
-  return { statusCode: res.statusCode, body: text, headers: res.headers };
+  return { statusCode: res.status, body: text, headers: res.headers };
 }
 
+async function get(path, _retry = false) {
+  const bases = HOSTS;
+  let lastErr;
+  for (let i = 0; i < bases.length; i++) {
+    const base = bases[(_hostIdx + i) % bases.length];
+    const url = path.startsWith("http") ? path : `${base}${path}`;
+    try {
+      const token = await resolveToken();
+      const { statusCode, body: text } = await mbRequest(url, {
+        method: "GET",
+        headers: buildHeaders("GET", url, token),
+      });
+
+      if ((statusCode === 406 || statusCode === 401) && !_retry) {
+        console.error(`[moviebox] ${statusCode} on GET ${path} — refreshing token`);
+        try { await getGuestToken(); } catch { /* */ }
+        return get(path, true);
+      }
+      if (statusCode === 407 && !_retry) {
+        // signature/host issues — try next host
+        lastErr = new Error(`GET ${path} → HTTP ${statusCode}: ${text.slice(0, 200)}`);
+        continue;
+      }
+      if (statusCode >= 400) {
+        throw new Error(`GET ${path} → HTTP ${statusCode}: ${text.slice(0, 300)}`);
+      }
+      const json = JSON.parse(text);
+      if (json.code !== 0) throw new Error(`API error ${json.code}: ${json.message}`);
+      _hostIdx = (_hostIdx + i) % bases.length;
+      return json.data;
+    } catch (e) {
+      lastErr = e;
+      console.warn("[moviebox] get fail", base, e?.message || e);
+    }
+  }
+  throw lastErr || new Error("GET failed all hosts");
+}
+
+async function post(path, body, _retry = false) {
+  const ct = "application/json;charset=UTF-8";
+  const bodyStr = JSON.stringify(body);
+  const bases = HOSTS;
+  let lastErr;
+  for (let i = 0; i < bases.length; i++) {
+    const base = bases[(_hostIdx + i) % bases.length];
+    // rewrite host query if present
+    let pathUse = path;
+    if (path.includes("host=")) {
+      pathUse = path.replace(/host=[^&]*/, `host=${encodeURIComponent(base)}`);
+    }
+    const url = pathUse.startsWith("http") ? pathUse : `${base}${pathUse}`;
+    try {
+      const token = await resolveToken();
+      const { statusCode, body: text } = await mbRequest(url, {
+        method: "POST",
+        headers: buildHeaders("POST", url, token, ct, bodyStr),
+        body: bodyStr,
+      });
+
+      if ((statusCode === 406 || statusCode === 401) && !_retry) {
+        try { await getGuestToken(); } catch { /* */ }
+        return post(path, body, true);
+      }
+      if (statusCode === 407 && !_retry) {
+        lastErr = new Error(`POST ${path} → HTTP ${statusCode}: ${text.slice(0, 200)}`);
+        continue;
+      }
+      if (statusCode >= 400) {
+        throw new Error(`POST ${path} → HTTP ${statusCode}: ${text.slice(0, 300)}`);
+      }
+      const json = JSON.parse(text);
+      if (json.code !== 0) throw new Error(`API error ${json.code}: ${json.message}`);
+      _hostIdx = (_hostIdx + i) % bases.length;
+      return json.data;
+    } catch (e) {
+      lastErr = e;
+      console.warn("[moviebox] post fail", base, e?.message || e);
+    }
+  }
+  throw lastErr || new Error("POST failed all hosts");
+}
+
+async function mirrorGet(path) {
+  const url = `${mirrorBase()}${path.startsWith("/") ? path : `/${path}`}`;
+  const { statusCode, body: text } = await rawRequest(url, {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    },
+  });
+  if (statusCode >= 400) throw new Error(`mirror ${statusCode}: ${text.slice(0, 200)}`);
+  return JSON.parse(text);
+}
+
+// temp-mail (direct)
 async function pollGuerrillaInbox(sid, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let seq = 0;
@@ -207,54 +324,22 @@ async function pollGuerrillaInbox(sid, timeoutMs) {
     await sleep(3000);
     try {
       const res = await rawRequest(
-        `https://api.guerrillamail.com/ajax.php?f=check_email&seq=${seq}&sid_token=${encodeURIComponent(sid)}`,
-        { method: "GET" }
+        `https://api.guerrillamail.com/ajax.php?f=check_email&seq=${seq}&sid_token=${encodeURIComponent(sid)}`
       );
       const data = JSON.parse(res.body);
-      const list = data.list || [];
-      for (const mail of list) {
+      for (const mail of data.list || []) {
         seq = Math.max(seq, Number(mail.mail_id) || 0);
         const full = await rawRequest(
-          `https://api.guerrillamail.com/ajax.php?f=fetch_email&email_id=${mail.mail_id}&sid_token=${encodeURIComponent(sid)}`,
-          { method: "GET" }
+          `https://api.guerrillamail.com/ajax.php?f=fetch_email&email_id=${mail.mail_id}&sid_token=${encodeURIComponent(sid)}`
         );
-        const body = full.body || "";
-        const m =
-          body.match(/\b(\d{4,8})\b/) ||
-          body.match(/verification[^0-9]*(\d{4,8})/i) ||
-          body.match(/code[^0-9]*(\d{4,8})/i);
+        const m = (full.body || "").match(/\b(\d{4,8})\b/);
         if (m) return m[1];
       }
     } catch (e) {
-      console.warn("[moviebox] inbox poll error:", e?.message || e);
+      console.warn("[moviebox] inbox poll:", e?.message || e);
     }
   }
   throw new Error("getGuestToken: timed out waiting for verification email");
-}
-
-async function getTempEmail() {
-  const providers = [
-    createTempmailLol,
-    createTempMailIo,
-    createGuerrillaMail,
-    createMailTm,
-  ];
-  const errors = [];
-  for (const create of providers) {
-    try {
-      const box = await create();
-      if (box?.email && box?.waitCode) {
-        console.log("[moviebox] temp-mail:", box.name, box.email);
-        return box;
-      }
-    } catch (e) {
-      errors.push(`${create.name}: ${e?.message || e}`);
-      console.warn("[moviebox] temp-mail provider failed:", create.name, e?.message || e);
-    }
-  }
-  throw new Error(
-    "getGuestToken: no temp email provider available — " + errors.join(" | ")
-  );
 }
 
 async function createTempmailLol() {
@@ -277,65 +362,12 @@ async function createTempmailLol() {
             `https://api.tempmail.lol/v2/inbox?token=${encodeURIComponent(j.token)}`
           );
           const data = JSON.parse(inbox.body);
-          const list = data.emails || data.messages || [];
-          for (const m of list) {
-            const body = `${m.subject || ""} ${m.body || ""} ${m.html || ""} ${m.text || ""}`;
-            const match =
-              body.match(/\b(\d{6})\b/) ||
-              body.match(/\b(\d{4,8})\b/) ||
-              body.match(/code[^0-9]*(\d{4,8})/i);
+          for (const m of data.emails || data.messages || []) {
+            const body = `${m.subject || ""} ${m.body || ""} ${m.html || ""}`;
+            const match = body.match(/\b(\d{6})\b/) || body.match(/\b(\d{4,8})\b/);
             if (match) return match[1];
           }
-        } catch {
-          /* retry */
-        }
-      }
-      throw new Error("getGuestToken: timed out waiting for verification email");
-    },
-  };
-}
-
-async function createTempMailIo() {
-  const res = await rawRequest("https://api.internal.temp-mail.io/api/v3/email/new", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: "{}",
-  });
-  const j = JSON.parse(res.body);
-  if (!j.email || !j.token) throw new Error("temp-mail.io: bad response");
-  return {
-    name: "temp-mail.io",
-    email: j.email,
-    waitCode: async (ms) => {
-      const deadline = Date.now() + ms;
-      while (Date.now() < deadline) {
-        await sleep(2500);
-        try {
-          const inbox = await rawRequest(
-            `https://api.internal.temp-mail.io/api/v3/email/${encodeURIComponent(j.email)}/messages`,
-            { headers: { Authorization: j.token } }
-          );
-          let list = [];
-          try {
-            list = JSON.parse(inbox.body);
-          } catch {
-            list = [];
-          }
-          if (!Array.isArray(list)) list = list?.messages || [];
-          for (const m of list) {
-            const id = m.id || m._id;
-            if (!id) continue;
-            const full = await rawRequest(
-              `https://api.internal.temp-mail.io/api/v3/message/${id}`,
-              { headers: { Authorization: j.token } }
-            );
-            const match =
-              full.body.match(/\b(\d{6})\b/) || full.body.match(/\b(\d{4,8})\b/);
-            if (match) return match[1];
-          }
-        } catch {
-          /* retry */
-        }
+        } catch { /* */ }
       }
       throw new Error("getGuestToken: timed out waiting for verification email");
     },
@@ -344,8 +376,7 @@ async function createTempMailIo() {
 
 async function createGuerrillaMail() {
   const gmRes = await rawRequest(
-    "https://api.guerrillamail.com/ajax.php?f=get_email_address",
-    { method: "GET" }
+    "https://api.guerrillamail.com/ajax.php?f=get_email_address"
   );
   const j = JSON.parse(gmRes.body);
   if (!j.email_addr || !j.sid_token) throw new Error("guerrilla: bad response");
@@ -356,107 +387,66 @@ async function createGuerrillaMail() {
   };
 }
 
-async function createMailTm() {
-  const domRes = await rawRequest("https://api.mail.tm/domains", { method: "GET" });
-  const domains = JSON.parse(domRes.body);
-  const domain =
-    domains["hydra:member"]?.[0]?.domain ||
-    domains[0]?.domain ||
-    null;
-  if (!domain) throw new Error("mail.tm: no domain");
-  const login = "mb" + randomBytes(5).toString("hex");
-  const password = "Mb!" + randomBytes(5).toString("hex");
-  const email = `${login}@${domain}`;
-  const acc = await rawRequest("https://api.mail.tm/accounts", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ address: email, password }),
-  });
-  if (acc.statusCode >= 400) throw new Error(`mail.tm account ${acc.statusCode}`);
-  const tokRes = await rawRequest("https://api.mail.tm/token", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ address: email, password }),
-  });
-  const bearer = JSON.parse(tokRes.body).token;
-  if (!bearer) throw new Error("mail.tm: no token");
-  return {
-    name: "mail.tm",
-    email,
-    waitCode: async (ms) => {
-      const deadline = Date.now() + ms;
-      while (Date.now() < deadline) {
-        await sleep(2500);
-        try {
-          const msgs = await rawRequest("https://api.mail.tm/messages", {
-            headers: { authorization: `Bearer ${bearer}` },
-          });
-          const list = JSON.parse(msgs.body)["hydra:member"] || [];
-          if (list.length) {
-            const full = await rawRequest(
-              "https://api.mail.tm/messages/" + list[0].id,
-              { headers: { authorization: `Bearer ${bearer}` } }
-            );
-            const match =
-              full.body.match(/\b(\d{6})\b/) || full.body.match(/\b(\d{4,8})\b/);
-            if (match) return match[1];
-          }
-        } catch {
-          /* retry */
-        }
+async function getTempEmail() {
+  for (const create of [createTempmailLol, createGuerrillaMail]) {
+    try {
+      const box = await create();
+      if (box?.email && box?.waitCode) {
+        console.log("[moviebox] temp-mail:", box.name, box.email);
+        return box;
       }
-      throw new Error("getGuestToken: timed out waiting for verification email");
-    },
-  };
+    } catch (e) {
+      console.warn("[moviebox] temp-mail failed:", create.name, e?.message || e);
+    }
+  }
+  throw new Error("getGuestToken: no temp email provider available");
 }
 
 async function _registerGuestAccount() {
   const freshDeviceId = randomBytes(16).toString("hex");
-  const freshGaid = [4, 2, 2, 2, 6]
-    .map((n) => randomBytes(n).toString("hex"))
-    .join("-");
-
-  function buildFreshClientInfo() {
-    return JSON.stringify({
-      package_name: "com.community.oneroom",
-      version_name: "4.0.02.0831.03",
-      version_code: 50020126,
-      os: "android",
-      os_version: "14",
-      install_ch: "google-play",
-      device_id: freshDeviceId,
-      install_store: "gp",
-      gaid: freshGaid,
-      brand: "Samsung",
-      model: "SM-G991B",
-      system_language: "en",
-      net: "NETWORK_WIFI",
-      region: "NG",
-      timezone: "Africa/Lagos",
-      sp_code: "62120",
-      "X-Child-UID": "",
-      "X-Client-Build": CLIENT_BUILD,
-      "X-Play-Mode": "2",
-      "X-Idle-Data": "1",
-      "X-Family-Mode": "0",
-      "X-Content-Mode": "0",
-    });
-  }
+  const freshGaid = [4, 2, 2, 2, 6].map((n) => randomBytes(n).toString("hex")).join("-");
+  const freshCI = JSON.stringify({
+    package_name: "com.community.oneroom",
+    version_name: "4.0.02.0831.03",
+    version_code: 50020126,
+    os: "android",
+    os_version: "14",
+    install_ch: "google-play",
+    device_id: freshDeviceId,
+    install_store: "gp",
+    gaid: freshGaid,
+    brand: "Samsung",
+    model: "SM-G991B",
+    system_language: "en",
+    net: "NETWORK_WIFI",
+    region: "NG",
+    timezone: "Africa/Lagos",
+    sp_code: "62120",
+    "X-Child-UID": "",
+    "X-Client-Build": CLIENT_BUILD,
+    "X-Play-Mode": "2",
+    "X-Idle-Data": "1",
+    "X-Family-Mode": "0",
+    "X-Content-Mode": "0",
+  });
 
   const { email, waitCode } = await getTempEmail();
   console.log("[moviebox] guest register email:", email);
 
-  const freshCI = buildFreshClientInfo();
-
-  async function proxyPost(path, body_obj) {
-    const url = `${BASE}${path}?${HOST_PARAM}`;
+  async function regPost(path, body_obj) {
+    const base = BASE;
+    const url = `${base}${path}?host=${encodeURIComponent(base)}`;
     const bodyStr = JSON.stringify(body_obj);
-    const ct = "application/json; charset=utf-8";
-    const sig = sign(url, { method: "POST", contentType: ct, body: bodyStr });
+    const ct = "application/json;charset=UTF-8";
+    const ts = String(Date.now());
+    const accept = "application/json";
+    const sig = sign(url, { method: "POST", accept, contentType: ct, body: bodyStr, timestampMs: ts });
     const { statusCode, body: text } = await mbRequest(url, {
       method: "POST",
       headers: {
+        accept,
         "x-tr-signature": sig,
+        "x-client-token": clientToken(ts),
         "x-client-info": freshCI,
         "x-client-build": CLIENT_BUILD,
         "user-agent": "okhttp/4.9.3",
@@ -464,148 +454,46 @@ async function _registerGuestAccount() {
       },
       body: bodyStr,
     });
-    if (statusCode === 429) {
-      const err = new Error("429");
-      err.is429 = true;
-      throw err;
-    }
     if (statusCode >= 400) {
-      throw new Error(`proxyPost ${path} → HTTP ${statusCode}: ${text.slice(0, 300)}`);
+      throw new Error(`regPost ${path} → HTTP ${statusCode}: ${text.slice(0, 300)}`);
     }
     const json = JSON.parse(text);
     if (json.code !== 0) throw new Error(`API error ${json.code}: ${json.message}`);
     return json.data;
   }
 
-  await proxyPost(`/wefeed-mobile-bff/user-api/get-sms-code`, {
+  await regPost(`/wefeed-mobile-bff/user-api/get-sms-code`, {
     type: 1,
     authType: 1,
     mail: email,
     package_name: "com.community.oneroom",
   });
-
   const code = await waitCode(55_000);
-
-  const regData = await proxyPost(`/wefeed-mobile-bff/user-api/register`, {
+  const regData = await regPost(`/wefeed-mobile-bff/user-api/register`, {
     authType: 1,
     mail: email,
     verificationCode: code,
     password: "Mb!" + Math.random().toString(36).slice(2, 10),
     package_name: "com.community.oneroom",
   });
-
   const token = regData?.token;
   if (!token) throw new Error("getGuestToken: no token in register response");
-  console.log("[moviebox] guest register OK via proxy");
+  console.log("[moviebox] guest register OK");
   return { token, clientInfo: freshCI };
 }
 
-function buildHeaders(method, url, token, contentType, body) {
-  const sig = sign(url, { method, contentType, body });
-  return {
-    "x-tr-signature": sig,
-    authorization: `Bearer ${token}`,
-    "x-client-info": activeClientInfo(),
-    "x-client-build": CLIENT_BUILD,
-    "x-play-mode": "2",
-    "x-idle-data": "1",
-    "x-family-mode": "0",
-    "x-content-mode": "0",
-    "x-client-status": "1",
-    "x-child-uid": "",
-    "user-agent": "okhttp/4.9.3",
-  };
-}
-
-async function get(path, _retry = false) {
-  const url = path.startsWith("http") ? path : `${BASE}${path}`;
-  const token = await resolveToken();
-  const { statusCode, body: text } = await mbRequest(url, {
-    method: "GET",
-    headers: buildHeaders("GET", url, token),
-  });
-
-  if ((statusCode === 406 || statusCode === 401) && !_retry) {
-    console.error(`[moviebox] ${statusCode} on GET ${path} — refreshing token`);
-    try {
-      await getGuestToken();
-    } catch {
-      /* keep static */
-    }
-    return get(path, true);
-  }
-
-  if (statusCode >= 400) {
-    throw new Error(`GET ${path} → HTTP ${statusCode}: ${text.slice(0, 300)}`);
-  }
-  const json = JSON.parse(text);
-  if (json.code !== 0) throw new Error(`API error ${json.code}: ${json.message}`);
-  return json.data;
-}
-
-async function post(path, body, _retry = false) {
-  const ct = "application/json; charset=utf-8";
-  const bodyStr = JSON.stringify(body);
-  const url = path.startsWith("http") ? path : `${BASE}${path}`;
-  const token = await resolveToken();
-  const { statusCode, body: text } = await mbRequest(url, {
-    method: "POST",
-    headers: {
-      ...buildHeaders("POST", url, token, ct, bodyStr),
-      "content-type": ct,
-    },
-    body: bodyStr,
-  });
-
-  if ((statusCode === 406 || statusCode === 401) && !_retry) {
-    console.error(`[moviebox] ${statusCode} on POST ${path} — refreshing token`);
-    try {
-      await getGuestToken();
-    } catch {
-      /* keep static */
-    }
-    return post(path, body, true);
-  }
-
-  if (statusCode >= 400) {
-    throw new Error(`POST ${path} → HTTP ${statusCode}: ${text.slice(0, 300)}`);
-  }
-  const json = JSON.parse(text);
-  if (json.code !== 0) throw new Error(`API error ${json.code}: ${json.message}`);
-  return json.data;
-}
-
-async function mirrorGet(path) {
-  const url = `${mirrorBase()}${path.startsWith("/") ? path : `/${path}`}`;
-  const { statusCode, body: text } = await rawRequest(url, {
-    method: "GET",
-    headers: {
-      Accept: "application/json",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    },
-  });
-  if (statusCode >= 400) throw new Error(`mirror ${statusCode}: ${text.slice(0, 200)}`);
-  return JSON.parse(text);
-}
-
-// ─── Public API ──────────────────────────────────────────────────────────────
-
 export async function search(keyword, page = 1, perPage = 20) {
   try {
-    return await post(`/wefeed-mobile-bff/subject-api/search/v2?${HOST_PARAM}`, {
+    return await post(`/wefeed-mobile-bff/subject-api/search/v2?host=${encodeURIComponent(BASE)}`, {
       keyword,
       page,
       perPage,
     });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    console.warn("[moviebox] search upstream failed:", msg.slice(0, 120));
+    console.warn("[moviebox] search upstream failed:", String(e?.message || e).slice(0, 120));
     try {
       const mir = await mirrorGet(`/api/search/${encodeURIComponent(keyword)}`);
-      if (mir?.status === "success" && mir?.data) {
-        return mir.data;
-      }
+      if (mir?.status === "success" && mir?.data) return mir.data;
     } catch (me) {
       console.warn("[moviebox] mirror search failed:", me?.message || me);
     }
@@ -624,7 +512,7 @@ export async function getSubject(subjectId, se) {
     return await get(`/wefeed-mobile-bff/subject-api/get?${q}`);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes("406") || msg.includes("401") || msg.includes("timeout")) {
+    if (msg.includes("406") || msg.includes("401") || msg.includes("timeout") || msg.includes("440")) {
       try {
         const mir = await mirrorGet(`/api/info/${encodeURIComponent(subjectId)}`);
         if (mir?.status === "success" && mir?.data) {
@@ -657,40 +545,8 @@ export async function getResources(subjectId, se, page = 1, perPage = 50, all = 
 }
 
 export async function getPlayInfo(subjectId, se, ep) {
-  const q = new URLSearchParams({
-    subjectId,
-    se: String(se),
-    ep: String(ep),
-  });
+  const q = new URLSearchParams({ subjectId, se: String(se), ep: String(ep) });
   return get(`/wefeed-mobile-bff/subject-api/play-info?${q}`);
-}
-
-export async function getStreamWithCookies(subjectId, se, ep, resolution = "480") {
-  const data = await getPlayInfo(subjectId, se, ep);
-  const streams = data.streams ?? [];
-  const stream =
-    streams.find((s) => String(s.resolutions) === String(resolution)) ?? streams[0];
-  if (!stream) throw new Error("No streams found");
-
-  const cookies = {};
-  for (const part of (stream.signCookie || "").split(";")) {
-    const idx = part.indexOf("=");
-    if (idx < 0) continue;
-    const k = part.slice(0, idx).trim();
-    const v = part.slice(idx + 1).trim();
-    if (k) cookies[k] = v;
-  }
-  const cookieHeader = Object.entries(cookies)
-    .map(([k, v]) => `${k}=${v}`)
-    .join("; ");
-
-  return {
-    url: stream.url,
-    resolution: stream.resolutions,
-    format: stream.format,
-    cookieHeader,
-    cookies,
-  };
 }
 
 export async function getStreamCaptions(subjectId, streamId) {
@@ -699,11 +555,7 @@ export async function getStreamCaptions(subjectId, streamId) {
 }
 
 export async function getExtCaptions(subjectId, resourceId, episode) {
-  const q = new URLSearchParams({
-    subjectId,
-    resourceId,
-    episode: String(episode),
-  });
+  const q = new URLSearchParams({ subjectId, resourceId, episode: String(episode) });
   return get(`/wefeed-mobile-bff/subject-api/get-ext-captions?${q}`);
 }
 
@@ -712,15 +564,11 @@ export async function getDubInfo(subjectId) {
 }
 
 export async function getTrending(everyoneSearch = 2) {
-  return get(
-    `/wefeed-mobile-bff/subject-api/search-rank?everyoneSearch=${everyoneSearch}`
-  );
+  return get(`/wefeed-mobile-bff/subject-api/search-rank?everyoneSearch=${everyoneSearch}`);
 }
 
 export async function getCommunityTrending(postNum = 3) {
-  return get(
-    `/wefeed-mobile-bff/community/trending-entrance?postNum=${postNum}`
-  );
+  return get(`/wefeed-mobile-bff/community/trending-entrance?postNum=${postNum}`);
 }
 
 export async function getDailyRec(page = 1, perPage = 20) {
@@ -728,11 +576,7 @@ export async function getDailyRec(page = 1, perPage = 20) {
 }
 
 export async function getRelated(subjectId, page = 1, perPage = 12) {
-  return post(`/wefeed-mobile-bff/subject-api/detail-rec`, {
-    subjectId,
-    page,
-    perPage,
-  });
+  return post(`/wefeed-mobile-bff/subject-api/detail-rec`, { subjectId, page, perPage });
 }
 
 export async function getStaffInfo(staffId) {
@@ -740,21 +584,8 @@ export async function getStaffInfo(staffId) {
 }
 
 export async function getStaffSubjects(staffId, start = 1, end = 20) {
-  const q = new URLSearchParams({
-    staffId,
-    start: String(start),
-    end: String(end),
-    pagerMode: "1",
-  });
+  const q = new URLSearchParams({ staffId, start: String(start), end: String(end), pagerMode: "1" });
   return get(`/wefeed-mobile-bff/subject-api/staff-subject-list?${q}`);
-}
-
-export async function getPostCount(subjectId) {
-  return get(`/wefeed-mobile-bff/post/count/subject?subjectId=${subjectId}`);
-}
-
-export async function getBottomTabs() {
-  return get(`/wefeed-mobile-bff/subject-api/bottom-tab`);
 }
 
 export async function getResourcePositionV2(subjectId, resourceId, resourceNum = 1) {
@@ -777,10 +608,6 @@ export async function checkDownloadAccess(subjectId, episodes, resolution = 480)
     eps: episodes,
     resolution: String(resolution),
   });
-}
-
-export async function startDownload(items) {
-  return post(`/wefeed-mobile-bff/subject-api/start-download-resource`, { items });
 }
 
 export { upstreamFetch };

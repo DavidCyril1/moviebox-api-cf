@@ -291,45 +291,49 @@ async function proxyMp4(c, { disposition }) {
   };
   if (rangeHeader) baseHeaders["range"] = rangeHeader;
 
-  // CDN also blocks CF IPs — go through the same random proxy
-  async function upstream(extra = {}) {
-    let url = mp4Url;
-    let last;
-    for (let hop = 0; hop < 6; hop++) {
-      last = await mb.upstreamFetch(url, {
-        method: "GET",
-        headers: { ...baseHeaders, ...extra },
-      });
-      const loc = last.headers.get?.("location") || last.headers.get?.("Location");
-      if (last.statusCode >= 300 && last.statusCode < 400 && loc) {
-        url = loc.startsWith("http") ? loc : new URL(loc, url).toString();
-        // drain redirect body
-        try {
-          if (last.body) {
-            const r = last.body.getReader();
-            while (true) {
-              const { done } = await r.read();
-              if (done) break;
-            }
-          }
-        } catch {
-          /* ignore */
-        }
-        continue;
-      }
-      return last;
+  const rangeHeader = c.req.header("range");
+
+  let cookieHeader = "";
+  try {
+    const play = await mb.getPlayInfo(subjectId, se, ep).catch(() => null);
+    const streams = play?.streams ?? [];
+    const pick =
+      streams.find((s) => String(s.resolutions || "").includes(String(actualRes))) ||
+      streams[0];
+    if (pick?.signCookie) {
+      cookieHeader = String(pick.signCookie)
+        .split(";")
+        .map((p) => p.trim())
+        .filter(Boolean)
+        .join("; ");
     }
-    return last;
+  } catch {
+    /* optional */
   }
 
-  let res = await upstream(cookieHeader ? { cookie: cookieHeader } : {});
+  const baseHeaders = {
+    "user-agent": "okhttp/4.12.0",
+    accept: "*/*",
+    "accept-encoding": "identity",
+  };
+  if (rangeHeader) baseHeaders["range"] = rangeHeader;
+  if (cookieHeader) baseHeaders["cookie"] = cookieHeader;
 
-  if (res.statusCode >= 400 && cookieHeader) {
-    res = await upstream({});
+  // CDN via SOCKS5 (same proxy) — CF egress blocked
+  let res = await mb.upstreamFetch(mp4Url, {
+    method: "GET",
+    headers: baseHeaders,
+    timeoutMs: 60_000,
+  });
+
+  if (res.status >= 400 && cookieHeader) {
+    const h2 = { ...baseHeaders };
+    delete h2.cookie;
+    res = await mb.upstreamFetch(mp4Url, { method: "GET", headers: h2, timeoutMs: 60_000 });
   }
 
-  if (res.statusCode >= 400) {
-    const err = new Error(`CDN returned ${res.statusCode}`);
+  if (res.status >= 400) {
+    const err = new Error(`CDN returned ${res.status}`);
     err.status = 502;
     throw err;
   }
@@ -354,7 +358,7 @@ async function proxyMp4(c, { disposition }) {
   if (cr) resHeaders["content-range"] = cr;
 
   return new Response(res.body, {
-    status: res.statusCode === 206 ? 206 : 200,
+    status: res.status === 206 ? 206 : 200,
     headers: resHeaders,
   });
 }
