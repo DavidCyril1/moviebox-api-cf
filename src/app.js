@@ -291,32 +291,6 @@ async function proxyMp4(c, { disposition }) {
   };
   if (rangeHeader) baseHeaders["range"] = rangeHeader;
 
-  const rangeHeader = c.req.header("range");
-
-  let cookieHeader = "";
-  try {
-    const play = await mb.getPlayInfo(subjectId, se, ep).catch(() => null);
-    const streams = play?.streams ?? [];
-    const pick =
-      streams.find((s) => String(s.resolutions || "").includes(String(actualRes))) ||
-      streams[0];
-    if (pick?.signCookie) {
-      cookieHeader = String(pick.signCookie)
-        .split(";")
-        .map((p) => p.trim())
-        .filter(Boolean)
-        .join("; ");
-    }
-  } catch {
-    /* optional */
-  }
-
-  const baseHeaders = {
-    "user-agent": "okhttp/4.12.0",
-    accept: "*/*",
-    "accept-encoding": "identity",
-  };
-  if (rangeHeader) baseHeaders["range"] = rangeHeader;
   if (cookieHeader) baseHeaders["cookie"] = cookieHeader;
 
   // CDN via SOCKS5 (same proxy) — CF egress blocked
