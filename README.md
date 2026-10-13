@@ -2,6 +2,8 @@
 
 Unofficial MovieBox scraper API. **Identical endpoints and response shapes** to [moviebox-api-node](https://github.com/DavidCyril1/moviebox-api-node).
 
+MovieBox blocks Cloudflare egress IPs, so all upstream API + CDN requests are routed through **proxy.maxwell.deals** (HTTP `:3128` / SOCKS5 `:1080`, picked at random) via `cloudflare:sockets`.
+
 ## Deploy
 
 ```bash
@@ -9,14 +11,7 @@ npm install
 npx wrangler deploy
 ```
 
-Optional KV for token persistence across isolates:
-
-```bash
-npx wrangler kv:namespace create TOKEN_STORE
-# paste the id into wrangler.toml under [[kv_namespaces]]
-```
-
-Optional secrets / vars:
+Optional vars / secrets:
 
 | Variable | Purpose |
 |----------|---------|
@@ -55,13 +50,12 @@ npm run dev
 | GET | `/staff/:staffId` |
 | GET | `/staff/:staffId/subjects?start=1&end=20` |
 | GET | `/download/:subjectId/:se/check?resolution=480&eps=1,2,3` |
-| GET | `/stream/:subjectId/:se/:ep?resolution=480` ← CDN-safe proxied MP4 (inline) |
-| GET | `/dl/:subjectId/:se/:ep?resolution=480` ← CDN-safe proxied MP4 (download) |
-| GET | `/pipe/:subjectId/:se/:ep?resolution=480` ← same proxy (compat) |
+| GET | `/stream/:subjectId/:se/:ep?resolution=480` |
+| GET | `/dl/:subjectId/:se/:ep?resolution=480` |
+| GET | `/pipe/:subjectId/:se/:ep?resolution=480` |
 
 ## Notes
 
-- Auto guest registration via temp-mail (same providers as Node). Registration uses direct outbound only (no SOCKS proxies on Workers).
-- Token can be persisted in KV (`TOKEN_STORE`) so it survives isolate recycling.
-- Stream/download proxy streams the real MP4 body (Range supported).
+- Auto guest registration via temp-mail (same providers as Node).
+- Stream/download proxy streams the real MP4 body (Range supported), also via the proxy.
 - Requires `nodejs_compat` (already set in `wrangler.toml`) for HMAC-MD5 signing.

@@ -291,21 +291,27 @@ async function proxyMp4(c, { disposition }) {
   };
   if (rangeHeader) baseHeaders["range"] = rangeHeader;
 
+  // CDN also blocks CF IPs — go through the same random proxy
   async function upstream(extra = {}) {
     let url = mp4Url;
     let last;
     for (let hop = 0; hop < 6; hop++) {
-      last = await fetch(url, {
-        headers: { ...baseHeaders, ...extra },
+      last = await mb.upstreamFetch(url, {
         method: "GET",
-        redirect: "manual",
+        headers: { ...baseHeaders, ...extra },
       });
-      if (last.status >= 300 && last.status < 400 && last.headers.get("location")) {
-        const loc = last.headers.get("location");
+      const loc = last.headers.get?.("location") || last.headers.get?.("Location");
+      if (last.statusCode >= 300 && last.statusCode < 400 && loc) {
         url = loc.startsWith("http") ? loc : new URL(loc, url).toString();
         // drain redirect body
         try {
-          await last.arrayBuffer();
+          if (last.body) {
+            const r = last.body.getReader();
+            while (true) {
+              const { done } = await r.read();
+              if (done) break;
+            }
+          }
         } catch {
           /* ignore */
         }
@@ -318,12 +324,12 @@ async function proxyMp4(c, { disposition }) {
 
   let res = await upstream(cookieHeader ? { cookie: cookieHeader } : {});
 
-  if (res.status >= 400 && cookieHeader) {
+  if (res.statusCode >= 400 && cookieHeader) {
     res = await upstream({});
   }
 
-  if (res.status >= 400) {
-    const err = new Error(`CDN returned ${res.status}`);
+  if (res.statusCode >= 400) {
+    const err = new Error(`CDN returned ${res.statusCode}`);
     err.status = 502;
     throw err;
   }
@@ -348,7 +354,7 @@ async function proxyMp4(c, { disposition }) {
   if (cr) resHeaders["content-range"] = cr;
 
   return new Response(res.body, {
-    status: res.status === 206 ? 206 : 200,
+    status: res.statusCode === 206 ? 206 : 200,
     headers: resHeaders,
   });
 }

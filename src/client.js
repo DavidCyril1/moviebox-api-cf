@@ -2,22 +2,23 @@
  * MovieBox API client — Cloudflare Workers port
  * Wraps https://api6.aoneroom.com/wefeed-mobile-bff/
  * Env: MB_TOKEN, MB_MIRROR_BASE, MB_GUEST_TIMEOUT_MS, MB_REQUEST_TIMEOUT_MS
- * Optional KV binding: TOKEN_STORE
  *
- * Token strategy (fail-soft, same as Node):
+ * All MovieBox upstream traffic goes through proxy.maxwell.deals
+ * (HTTP / SOCKS5, random) because CF egress IPs are blocked.
+ *
+ * Token strategy (fail-soft):
  *  1) in-memory cache
  *  2) MB_TOKEN env
- *  3) KV cache (if TOKEN_STORE bound)
- *  4) baked FALLBACK_TOKEN while still valid
- *  5) guest registration via temp-mail — short timeout, never blocks forever
+ *  3) baked FALLBACK_TOKEN while still valid
+ *  4) guest registration via temp-mail
  */
 import { sign } from "./sign.js";
 import { randomBytes } from "node:crypto";
+import { upstreamFetch } from "./proxy.js";
 
 const BASE = "https://api6.aoneroom.com";
 
 function getEnv(key, fallback = undefined) {
-  // Prefer request-scoped env (set on app.env by index.js)
   const e = globalThis.__MB_ENV__ || {};
   if (e[key] !== undefined && e[key] !== "") return e[key];
   if (typeof process !== "undefined" && process.env?.[key]) return process.env[key];
@@ -104,35 +105,7 @@ function isTokenUsable(token) {
   return !exp || exp - Date.now() > 3_600_000;
 }
 
-async function loadKvToken() {
-  try {
-    const kv = globalThis.__MB_ENV__?.TOKEN_STORE;
-    if (!kv) return null;
-    const raw = await kv.get("mb_token", "json");
-    if (raw?.token && isTokenUsable(raw.token)) {
-      return { token: raw.token, clientInfo: raw.clientInfo || null };
-    }
-  } catch {
-    /* ignore */
-  }
-  return null;
-}
-
-async function saveKvToken(token, clientInfo = null) {
-  try {
-    const kv = globalThis.__MB_ENV__?.TOKEN_STORE;
-    if (!kv) return;
-    await kv.put(
-      "mb_token",
-      JSON.stringify({ token, clientInfo, savedAt: Date.now() }),
-      { expirationTtl: 60 * 60 * 24 * 80 } // ~80 days
-    );
-  } catch (e) {
-    console.warn("[moviebox] could not persist token to KV:", e?.message || e);
-  }
-}
-
-function pickStaticTokenSync() {
+function pickStaticToken() {
   const envTok = getEnv("MB_TOKEN");
   if (envTok && isTokenUsable(envTok)) {
     return { token: envTok, clientInfo: getEnv("MB_CLIENT_INFO") || null };
@@ -144,13 +117,7 @@ function pickStaticTokenSync() {
 
 async function resolveToken() {
   if (_cachedToken && isTokenUsable(_cachedToken)) return _cachedToken;
-  const kv = await loadKvToken();
-  if (kv) {
-    _cachedToken = kv.token;
-    if (kv.clientInfo) _cachedClientInfo = kv.clientInfo;
-    return _cachedToken;
-  }
-  const staticTok = pickStaticTokenSync();
+  const staticTok = pickStaticToken();
   _cachedToken = staticTok.token;
   if (staticTok.clientInfo) _cachedClientInfo = staticTok.clientInfo;
   return _cachedToken;
@@ -160,15 +127,12 @@ function rememberToken(token, clientInfo = null) {
   if (!token) return;
   _cachedToken = token;
   if (clientInfo) _cachedClientInfo = clientInfo;
-  // fire-and-forget KV write
-  saveKvToken(token, _cachedClientInfo);
 }
 
 function activeClientInfo() {
   return _cachedClientInfo || CLIENT_INFO;
 }
 
-/** Public entry — may refresh guest; never hangs > guestTimeoutMs */
 export async function getGuestToken() {
   if (_guestTokenInflight) return _guestTokenInflight;
 
@@ -191,7 +155,7 @@ export async function getGuestToken() {
     } catch (e) {
       _lastGuestFailAt = Date.now();
       console.error("[moviebox] getGuestToken failed:", e?.message || e);
-      const fallback = pickStaticTokenSync();
+      const fallback = pickStaticToken();
       if (fallback?.token) {
         _cachedToken = fallback.token;
         if (fallback.clientInfo) _cachedClientInfo = fallback.clientInfo;
@@ -206,6 +170,7 @@ export async function getGuestToken() {
   return _guestTokenInflight;
 }
 
+/** Temp-mail providers stay on direct fetch (they don't block CF). */
 async function rawRequest(url, opts = {}) {
   const controller = new AbortController();
   const to = setTimeout(() => controller.abort(), requestTimeoutMs());
@@ -221,6 +186,18 @@ async function rawRequest(url, opts = {}) {
   } finally {
     clearTimeout(to);
   }
+}
+
+/** MovieBox upstream — always via proxy */
+async function mbRequest(url, opts = {}) {
+  const res = await upstreamFetch(url, {
+    method: opts.method || "GET",
+    headers: opts.headers,
+    body: opts.body,
+    timeoutMs: requestTimeoutMs(),
+  });
+  const text = await res.text();
+  return { statusCode: res.statusCode, body: text, headers: res.headers };
 }
 
 async function pollGuerrillaInbox(sid, timeoutMs) {
@@ -466,7 +443,6 @@ async function _registerGuestAccount() {
     });
   }
 
-  // Workers cannot use arbitrary SOCKS/HTTP proxies easily; try direct only
   const { email, waitCode } = await getTempEmail();
   console.log("[moviebox] guest register email:", email);
 
@@ -477,7 +453,7 @@ async function _registerGuestAccount() {
     const bodyStr = JSON.stringify(body_obj);
     const ct = "application/json; charset=utf-8";
     const sig = sign(url, { method: "POST", contentType: ct, body: bodyStr });
-    const { statusCode, body: text } = await rawRequest(url, {
+    const { statusCode, body: text } = await mbRequest(url, {
       method: "POST",
       headers: {
         "x-tr-signature": sig,
@@ -520,7 +496,7 @@ async function _registerGuestAccount() {
 
   const token = regData?.token;
   if (!token) throw new Error("getGuestToken: no token in register response");
-  console.log("[moviebox] guest register OK via direct");
+  console.log("[moviebox] guest register OK via proxy");
   return { token, clientInfo: freshCI };
 }
 
@@ -544,7 +520,7 @@ function buildHeaders(method, url, token, contentType, body) {
 async function get(path, _retry = false) {
   const url = path.startsWith("http") ? path : `${BASE}${path}`;
   const token = await resolveToken();
-  const { statusCode, body: text } = await rawRequest(url, {
+  const { statusCode, body: text } = await mbRequest(url, {
     method: "GET",
     headers: buildHeaders("GET", url, token),
   });
@@ -572,7 +548,7 @@ async function post(path, body, _retry = false) {
   const bodyStr = JSON.stringify(body);
   const url = path.startsWith("http") ? path : `${BASE}${path}`;
   const token = await resolveToken();
-  const { statusCode, body: text } = await rawRequest(url, {
+  const { statusCode, body: text } = await mbRequest(url, {
     method: "POST",
     headers: {
       ...buildHeaders("POST", url, token, ct, bodyStr),
@@ -613,7 +589,7 @@ async function mirrorGet(path) {
   return JSON.parse(text);
 }
 
-// ─── Public API used by app.js ───────────────────────────────────────────────
+// ─── Public API ──────────────────────────────────────────────────────────────
 
 export async function search(keyword, page = 1, perPage = 20) {
   try {
@@ -807,12 +783,12 @@ export async function startDownload(items) {
   return post(`/wefeed-mobile-bff/subject-api/start-download-resource`, { items });
 }
 
-/** Call once per request to inject env / KV */
+export { upstreamFetch };
+
 export function bindEnv(env) {
   globalThis.__MB_ENV__ = env || {};
-  // Warm static token
   if (!_cachedToken) {
-    const boot = pickStaticTokenSync();
+    const boot = pickStaticToken();
     _cachedToken = boot.token;
     if (boot.clientInfo) _cachedClientInfo = boot.clientInfo;
   }
