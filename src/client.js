@@ -5,7 +5,7 @@
  */
 import { sign, clientToken } from "./sign.js";
 import { randomBytes, createHash } from "node:crypto";
-import { upstreamFetch } from "./proxy.js";
+import { upstreamFetch, isBlockedPayload } from "./proxy.js";
 
 const BASE = "https://api6.aoneroom.com";
 const HOSTS = [
@@ -32,8 +32,8 @@ const CLIENT_BUILD =
 
 const CLIENT_INFO = JSON.stringify({
   package_name: "com.community.oneroom",
-  version_name: "4.0.02.0831.03",
-  version_code: 50020126,
+  version_name: "4.0.03.0922.03",
+  version_code: 50020131,
   os: "android",
   os_version: "14",
   install_ch: "google-play",
@@ -216,14 +216,24 @@ async function mbRequest(url, opts = {}) {
   } catch {
     host = undefined;
   }
-  const res = await upstreamFetch(url, {
+  const baseOpts = {
     method: opts.method || "GET",
     headers: opts.headers,
     body: opts.body,
     timeoutMs: requestTimeoutMs(),
     tlsHostname: host,
-  });
-  const text = await res.text();
+  };
+  let res = await upstreamFetch(url, baseOpts);
+  let text = await res.text();
+  // Second pass forced SOCKS if still blocked (upstream already tries both, but keep safe)
+  if (isBlockedPayload(res.status, text) && !opts._socksDone) {
+    try {
+      res = await upstreamFetch(url, { ...baseOpts, preferSocks: true });
+      text = await res.text();
+    } catch (e) {
+      console.warn("[moviebox] socks second pass:", e?.message || e);
+    }
+  }
   return { statusCode: res.status, body: text, headers: res.headers };
 }
 
@@ -245,7 +255,7 @@ async function get(path, _retry = false) {
         try { await getGuestToken(); } catch { /* */ }
         return get(path, true);
       }
-      if (statusCode === 407 && !_retry) {
+      if ((statusCode === 407 || statusCode === 440 || statusCode === 441) && !_retry) {
         // signature/host issues — try next host
         lastErr = new Error(`GET ${path} → HTTP ${statusCode}: ${text.slice(0, 200)}`);
         continue;
@@ -290,7 +300,7 @@ async function post(path, body, _retry = false) {
         try { await getGuestToken(); } catch { /* */ }
         return post(path, body, true);
       }
-      if (statusCode === 407 && !_retry) {
+      if ((statusCode === 407 || statusCode === 440 || statusCode === 441) && !_retry) {
         lastErr = new Error(`POST ${path} → HTTP ${statusCode}: ${text.slice(0, 200)}`);
         continue;
       }
@@ -414,8 +424,8 @@ async function _registerGuestAccount() {
   const freshGaid = [4, 2, 2, 2, 6].map((n) => randomBytes(n).toString("hex")).join("-");
   const freshCI = JSON.stringify({
     package_name: "com.community.oneroom",
-    version_name: "4.0.02.0831.03",
-    version_code: 50020126,
+    version_name: "4.0.03.0922.03",
+    version_code: 50020131,
     os: "android",
     os_version: "14",
     install_ch: "google-play",
@@ -489,29 +499,71 @@ async function _registerGuestAccount() {
   return { token, clientInfo: freshCI };
 }
 
-export async function search(keyword, page = 1, perPage = 20) {
-  try {
-    return await post(`/wefeed-mobile-bff/subject-api/search/v2?host=${encodeURIComponent(BASE)}`, {
-      keyword,
-      page,
-      perPage,
-    });
-  } catch (e) {
-    console.warn("[moviebox] search upstream failed:", String(e?.message || e).slice(0, 160));
-    try {
-      const mir = await mirrorGet(`/api/search/${encodeURIComponent(keyword)}`);
-      if (mir?.status === "success" && mir?.data) return mir.data;
-      // some mirrors return { success, data }
-      if (mir?.success && mir?.data) return mir.data;
-    } catch (me) {
-      console.warn("[moviebox] mirror search failed:", me?.message || me);
+function normalizeSearchData(data) {
+  if (!data || typeof data !== "object") return data;
+  // Mobile v2 shape
+  if (Array.isArray(data.results) && data.results.length) return data;
+  // Some edges return items[] of subjects
+  if (Array.isArray(data.items) && data.items.length) {
+    const subjects = data.items.filter((x) => x && (x.subjectId || x.title));
+    if (subjects.length) {
+      return {
+        ...data,
+        results: [{ topicType: "SUBJECT", subjects }],
+      };
     }
-    const err = new Error(
-      `search failed: ${e instanceof Error ? e.message : String(e)}`
-    );
-    err.status = 502;
-    throw err;
   }
+  return data;
+}
+
+function searchHasHits(data) {
+  if (!data) return false;
+  if (Array.isArray(data.results)) {
+    for (const r of data.results) {
+      if ((r?.subjects || []).length) return true;
+    }
+  }
+  if (Array.isArray(data.items) && data.items.some((x) => x?.subjectId)) return true;
+  return false;
+}
+
+export async function search(keyword, page = 1, perPage = 20) {
+  const attempts = [];
+  // Primary mobile search v2
+  try {
+    const data = await post(
+      `/wefeed-mobile-bff/subject-api/search/v2?host=${encodeURIComponent(BASE)}`,
+      { keyword, page, perPage }
+    );
+    const norm = normalizeSearchData(data);
+    if (searchHasHits(norm)) return norm;
+    attempts.push("v2 empty");
+  } catch (e) {
+    attempts.push(`v2: ${e?.message || e}`);
+  }
+  // Alternate search path (older)
+  try {
+    const data = await post(
+      `/wefeed-mobile-bff/subject-api/search?host=${encodeURIComponent(BASE)}`,
+      { keyword, page, perPage, subjectType: 0 }
+    );
+    const norm = normalizeSearchData(data);
+    if (searchHasHits(norm)) return norm;
+    attempts.push("v1 empty");
+  } catch (e) {
+    attempts.push(`v1: ${e?.message || e}`);
+  }
+  // Mirror last resort
+  try {
+    const mir = await mirrorGet(`/api/search/${encodeURIComponent(keyword)}`);
+    if (mir?.status === "success" && mir?.data && searchHasHits(mir.data)) return mir.data;
+    if (mir?.success && mir?.data && searchHasHits(mir.data)) return mir.data;
+  } catch (me) {
+    attempts.push(`mirror: ${me?.message || me}`);
+  }
+  const err = new Error(`search failed (${attempts.join(" | ")})`);
+  err.status = 502;
+  throw err;
 }
 
 export async function getSubject(subjectId, se) {
@@ -554,8 +606,32 @@ export async function getResources(subjectId, se, page = 1, perPage = 50, all = 
 }
 
 export async function getPlayInfo(subjectId, se, ep) {
-  const q = new URLSearchParams({ subjectId, se: String(se), ep: String(ep) });
-  return get(`/wefeed-mobile-bff/subject-api/play-info?${q}`);
+  try {
+    return await get(
+      `/wefeed-mobile-bff/subject-api/play-info?subjectId=${subjectId}&se=${se}&ep=${ep}`
+    );
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (!/440|ServiceNotAvailable|406/.test(msg)) throw e;
+    // Fallback: resource list + position v2
+    const seNum = Number(se) || 0;
+    const epNum = Number(ep) || 0;
+    const res = await getResources(subjectId, seNum || 1, 1, 30, 0).catch(() => null);
+    const list = res?.list || [];
+    let item =
+      list.find((i) => Number(i.se) === seNum && Number(i.ep) === epNum) ||
+      list.find((i) => Number(i.se || 0) === 0 && Number(i.ep || 0) === 0) ||
+      list[0];
+    if (!item?.resourceId) throw e;
+    const pos = await getResourcePositionV2(subjectId, item.resourceId, 1);
+    const link = (pos?.list || [])[0]?.resourceLink;
+    return {
+      streams: link
+        ? [{ format: "MP4", url: link, resolution: item.resolution || 480, id: item.resourceId }]
+        : [],
+      _fallback: "resource-position",
+    };
+  }
 }
 
 export async function getStreamCaptions(subjectId, streamId) {

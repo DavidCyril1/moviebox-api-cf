@@ -1,7 +1,7 @@
 /**
- * Upstream fetch for MovieBox API.
- * Prefer native fetch (valid token + NG client-info works from CF egress).
- * SOCKS5/socksflare only as fallback — proxy exit is often 406/region-blocked.
+ * Dual-path upstream: native CF + SOCKS5 (socksflare).
+ * MovieBox often returns HTTP 440 ServiceNotAvailable on CF IPs —
+ * those must fall through to SOCKS, not be treated as success.
  */
 import { Socks5Client } from "socksflare";
 
@@ -27,6 +27,15 @@ function hostnameOf(url) {
   }
 }
 
+/** True if MovieBox is soft-blocking this edge/IP. */
+export function isBlockedPayload(status, text) {
+  if (status === 403 || status === 407 || status === 440 || status === 441) return true;
+  if (!text) return false;
+  return /ServiceNotAvailable|not available in current region|FORBIDDEN|find no content|wasmTls/i.test(
+    text
+  );
+}
+
 /**
  * @returns {Promise<Response>}
  */
@@ -38,53 +47,71 @@ export async function upstreamFetch(url, opts = {}) {
   };
   const timeoutMs = opts.timeoutMs || 30_000;
   const tlsHostname = opts.tlsHostname || hostnameOf(url);
+  const preferSocks = Boolean(opts.preferSocks);
   const errors = [];
 
-  // 1) Native CF fetch first
-  try {
+  async function tryNative() {
     const controller = new AbortController();
     const to = setTimeout(() => controller.abort("timeout"), timeoutMs);
     try {
-      const res = await fetch(url, {
+      return await fetch(url, {
         method: init.method,
         headers: init.headers,
         body: init.body,
         signal: controller.signal,
         redirect: "follow",
       });
-      // Treat hard blocks as failure so we can try SOCKS
-      if (res.status !== 403 && res.status !== 407) {
-        return res;
-      }
-      const peek = await res.clone().text().catch(() => "");
-      if (!/region|FORBIDDEN|not available/i.test(peek) && res.status !== 403) {
-        return res;
-      }
-      errors.push(`native HTTP ${res.status}: ${peek.slice(0, 120)}`);
     } finally {
       clearTimeout(to);
     }
-  } catch (e) {
-    errors.push(`native: ${e?.message || e}`);
   }
 
-  // 2) SOCKS5 + WASM TLS fallback
-  const options = {
-    httpVersion: "1.1",
-    timeoutMs,
-    tlsHostname,
-  };
-  if (opts.maxResponseBytes != null) options.maxResponseBytes = opts.maxResponseBytes;
+  async function trySocks() {
+    const options = {
+      httpVersion: "1.1",
+      timeoutMs,
+      tlsHostname,
+    };
+    if (opts.maxResponseBytes != null) options.maxResponseBytes = opts.maxResponseBytes;
+    let last;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const c = attempt === 0 ? _client || freshClient() : freshClient();
+        return await c.fetch(url, init, options);
+      } catch (e) {
+        last = e;
+        _client = null;
+        errors.push(`socks[${attempt}]: ${e?.message || e}`);
+      }
+    }
+    throw last || new Error("socks failed");
+  }
 
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const order = preferSocks ? ["socks", "native"] : ["native", "socks"];
+  let lastRes = null;
+  let lastText = "";
+
+  for (const path of order) {
     try {
-      const c = attempt === 0 ? (_client || freshClient()) : freshClient();
-      return await c.fetch(url, init, options);
+      const res = path === "native" ? await tryNative() : await trySocks();
+      const text = await res.text();
+      // Rebuild Response so callers can still .text()
+      const rebuilt = new Response(text, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: res.headers,
+      });
+      if (!isBlockedPayload(res.status, text)) {
+        return rebuilt;
+      }
+      lastRes = rebuilt;
+      lastText = text;
+      errors.push(`${path} blocked HTTP ${res.status}: ${text.slice(0, 100)}`);
     } catch (e) {
-      errors.push(`socks[${attempt}]: ${e?.message || e}`);
-      _client = null;
+      errors.push(`${path}: ${e?.message || e}`);
     }
   }
 
+  if (lastRes) return lastRes;
   throw new Error(`upstreamFetch failed: ${errors.join(" | ")}`);
 }
