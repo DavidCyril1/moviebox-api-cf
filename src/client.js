@@ -61,7 +61,7 @@ const FALLBACK_TOKEN =
   ".l4MFha-s4DfMUOEQqPUGKZ_1NqfgI7NewaGJ0Saruik";
 
 function requestTimeoutMs() {
-  return Number(getEnv("MB_REQUEST_TIMEOUT_MS") || 25_000);
+  return Number(getEnv("MB_REQUEST_TIMEOUT_MS") || 30_000);
 }
 function guestTimeoutMs() {
   return Number(getEnv("MB_GUEST_TIMEOUT_MS") || 90_000);
@@ -210,11 +210,18 @@ function buildHeaders(method, url, token, contentType, body) {
 }
 
 async function mbRequest(url, opts = {}) {
+  let host;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    host = undefined;
+  }
   const res = await upstreamFetch(url, {
     method: opts.method || "GET",
     headers: opts.headers,
     body: opts.body,
     timeoutMs: requestTimeoutMs(),
+    tlsHostname: host,
   });
   const text = await res.text();
   return { statusCode: res.status, body: text, headers: res.headers };
@@ -490,18 +497,20 @@ export async function search(keyword, page = 1, perPage = 20) {
       perPage,
     });
   } catch (e) {
-    console.warn("[moviebox] search upstream failed:", String(e?.message || e).slice(0, 120));
+    console.warn("[moviebox] search upstream failed:", String(e?.message || e).slice(0, 160));
     try {
       const mir = await mirrorGet(`/api/search/${encodeURIComponent(keyword)}`);
       if (mir?.status === "success" && mir?.data) return mir.data;
+      // some mirrors return { success, data }
+      if (mir?.success && mir?.data) return mir.data;
     } catch (me) {
       console.warn("[moviebox] mirror search failed:", me?.message || me);
     }
-    return {
-      pager: { hasMore: false, page: String(page), perPage, totalCount: 0 },
-      items: [],
-      results: [],
-    };
+    const err = new Error(
+      `search failed: ${e instanceof Error ? e.message : String(e)}`
+    );
+    err.status = 502;
+    throw err;
   }
 }
 
