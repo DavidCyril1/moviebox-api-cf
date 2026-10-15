@@ -1,11 +1,7 @@
 /**
- * Outbound via SOCKS5 + Rustls WASM (socksflare).
- * CF startTls() after CONNECT is broken on the edge.
- *
- * Strategy:
- *  1) socksflare with explicit SNI (tlsHostname)
- *  2) fresh Socks5Client retry
- *  3) native fetch fallback (some MovieBox edges still answer CF)
+ * Upstream fetch for MovieBox API.
+ * Prefer native fetch (valid token + NG client-info works from CF egress).
+ * SOCKS5/socksflare only as fallback — proxy exit is often 406/region-blocked.
  */
 import { Socks5Client } from "socksflare";
 
@@ -20,11 +16,6 @@ let _client = null;
 
 function freshClient() {
   _client = new Socks5Client({ ...SOCKS });
-  return _client;
-}
-
-function client() {
-  if (!_client) return freshClient();
   return _client;
 }
 
@@ -45,33 +36,11 @@ export async function upstreamFetch(url, opts = {}) {
     headers: opts.headers || {},
     body: opts.body,
   };
-  const tlsHostname = opts.tlsHostname || hostnameOf(url);
   const timeoutMs = opts.timeoutMs || 30_000;
-  const options = {
-    httpVersion: "1.1",
-    timeoutMs,
-    tlsHostname,
-  };
-  if (opts.maxResponseBytes != null) options.maxResponseBytes = opts.maxResponseBytes;
-
+  const tlsHostname = opts.tlsHostname || hostnameOf(url);
   const errors = [];
 
-  // Attempt 1: existing / new socks client
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const c = attempt === 0 ? client() : freshClient();
-      const res = await c.fetch(url, init, options);
-      if (res && res.status > 0) return res;
-      errors.push(`socks empty status attempt=${attempt}`);
-    } catch (e) {
-      const msg = e?.message || String(e);
-      errors.push(`socks[${attempt}]: ${msg}`);
-      console.warn("[moviebox] socksflare fail:", msg);
-      _client = null;
-    }
-  }
-
-  // Attempt 2: native fetch (CF egress) — works when MovieBox is not ASN-blocking this POP
+  // 1) Native CF fetch first
   try {
     const controller = new AbortController();
     const to = setTimeout(() => controller.abort("timeout"), timeoutMs);
@@ -83,7 +52,15 @@ export async function upstreamFetch(url, opts = {}) {
         signal: controller.signal,
         redirect: "follow",
       });
-      return res;
+      // Treat hard blocks as failure so we can try SOCKS
+      if (res.status !== 403 && res.status !== 407) {
+        return res;
+      }
+      const peek = await res.clone().text().catch(() => "");
+      if (!/region|FORBIDDEN|not available/i.test(peek) && res.status !== 403) {
+        return res;
+      }
+      errors.push(`native HTTP ${res.status}: ${peek.slice(0, 120)}`);
     } finally {
       clearTimeout(to);
     }
@@ -91,5 +68,23 @@ export async function upstreamFetch(url, opts = {}) {
     errors.push(`native: ${e?.message || e}`);
   }
 
-  throw new Error(`upstreamFetch failed for ${hostnameOf(url) || url}: ${errors.join(" | ")}`);
+  // 2) SOCKS5 + WASM TLS fallback
+  const options = {
+    httpVersion: "1.1",
+    timeoutMs,
+    tlsHostname,
+  };
+  if (opts.maxResponseBytes != null) options.maxResponseBytes = opts.maxResponseBytes;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const c = attempt === 0 ? (_client || freshClient()) : freshClient();
+      return await c.fetch(url, init, options);
+    } catch (e) {
+      errors.push(`socks[${attempt}]: ${e?.message || e}`);
+      _client = null;
+    }
+  }
+
+  throw new Error(`upstreamFetch failed: ${errors.join(" | ")}`);
 }

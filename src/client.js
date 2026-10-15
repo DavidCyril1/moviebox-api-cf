@@ -56,9 +56,9 @@ const CLIENT_INFO = JSON.stringify({
 });
 
 const FALLBACK_TOKEN =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" +
-  ".eyJ1aWQiOjkxMTAyODI4OTUyNzIzMzgzOTIsInV0cCI6MSwiZXhwIjoxNzk2MDcxNTgwLCJpYXQiOjE3ODgyOTUyODB9" +
-  ".l4MFha-s4DfMUOEQqPUGKZ_1NqfgI7NewaGJ0Saruik";
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjc1MDgxNDc4NTM" +
+  "0ODQwODk4NDAsInV0cCI6MSwiZXhwIjoxNzk5ODMyNjM3LCJpYXQiOjE3OTI" +
+  "wNTYzMzd9.ueRswnl4TsffTMvTaVSBwqi2gonGZZD7Pdfi7slUFQs";
 
 function requestTimeoutMs() {
   return Number(getEnv("MB_REQUEST_TIMEOUT_MS") || 30_000);
